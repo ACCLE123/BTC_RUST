@@ -2,6 +2,13 @@ use sha2::{Sha256, Digest};
 use chrono::prelude::*;
 use serde::{Serialize, Deserialize};
 use ed25519_dalek::{SigningKey, Signature, Signer, Verifier, VerifyingKey};
+use axum::{
+    routing::{get, post},
+    Json, Router, extract::State,
+    http::StatusCode,
+};
+use std::sync::{Arc, RwLock};
+use tower_http::cors::CorsLayer;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Transaction {
@@ -158,9 +165,11 @@ impl Block {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Blockchain {
     pub chain: Vec<Block>,
     pub difficulty: usize,
+    pub pending_transactions: Vec<Transaction>,
 }
 
 impl Blockchain {
@@ -176,74 +185,82 @@ impl Blockchain {
         Blockchain {
             chain: vec![genesis_block],
             difficulty,
+            pending_transactions: Vec::new(),
         }
     }
 
-    pub fn add_block(&mut self, transactions: Vec<Transaction>) {
-        // 验证所有交易的签名
-        for tx in &transactions {
-            if !tx.is_valid() {
-                println!("Transaction verification failed! Block discarded.");
-                return;
-            }
+    pub fn add_transaction(&mut self, transaction: Transaction) -> Result<(), &'static str> {
+        if !transaction.is_valid() {
+            return Err("Invalid transaction signature");
+        }
+        self.pending_transactions.push(transaction);
+        Ok(())
+    }
+
+    pub fn mine_pending_transactions(&mut self) -> Result<(), &'static str> {
+        if self.pending_transactions.is_empty() {
+            return Err("No transactions to mine");
         }
 
         let previous_hash = self.chain.last().unwrap().hash.clone();
-        let mut new_block = Block::new(self.chain.len() as u32, transactions, previous_hash);
+        let mut new_block = Block::new(
+            self.chain.len() as u32,
+            self.pending_transactions.clone(),
+            previous_hash,
+        );
         new_block.mine(self.difficulty);
         self.chain.push(new_block);
+        self.pending_transactions.clear();
+        Ok(())
     }
 }
 
-fn main() {
-    use rand::rngs::OsRng;
-    
-    // 1. 生成一对密钥 (模拟用户钱包)
-    let mut csprng = OsRng;
+struct AppState {
+    blockchain: RwLock<Blockchain>,
+}
 
+#[tokio::main]
+async fn main() {
+    let blockchain = Blockchain::new(4);
+    let shared_state = Arc::new(AppState {
+        blockchain: RwLock::new(blockchain),
+    });
 
+    let app = Router::new()
+        .route("/blocks", get(get_blocks))
+        .route("/transactions", post(add_transaction))
+        .route("/mine", post(mine_block))
+        .layer(CorsLayer::permissive())
+        .with_state(shared_state);
 
-    let signing_key: SigningKey = SigningKey::generate(&mut csprng);
-    let verifying_key: VerifyingKey = VerifyingKey::from(&signing_key);
-    let sender_pub_key = hex::encode(verifying_key.to_bytes());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    println!("Blockchain server running on http://127.0.0.1:3000");
+    axum::serve(listener, app).await.unwrap();
+}
 
-    // 2. 初始化区块链
-    let mut btc_clone = Blockchain::new(4);
+async fn get_blocks(State(state): State<Arc<AppState>>) -> Json<Vec<Block>> {
+    let bc = state.blockchain.read().unwrap();
+    Json(bc.chain.clone())
+}
 
-    // 3. 创建并签名一笔交易
-    println!("Creating transaction...");
-    let mut tx1 = Transaction {
-        sender: sender_pub_key.clone(),
-        receiver: "Bob_Address".to_string(),
-        amount: 10.5,
-        signature: None,
-    };
-    
-    // 签署交易
-    tx1.sign(&signing_key);
-    println!("Transaction signed.");
+async fn add_transaction(
+    State(state): State<Arc<AppState>>,
+    Json(tx): Json<Transaction>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    let mut bc = state.blockchain.write().unwrap();
+    match bc.add_transaction(tx) {
+        Ok(_) => Ok(Json("Transaction added to mempool".to_string())),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
+    }
+}
 
-    // 4. 将交易打包进区块
-    println!("Mining block 1...");
-    let txs1 = vec![tx1];
-    btc_clone.add_block(txs1);
-
-    // 5. 打印区块链信息
-    for block in btc_clone.chain {
-        println!("---------------------------------------");
-        println!("Index: {}", block.header.index);
-        println!("Hash: {}", block.hash);
-        println!("Transactions: {}", block.transactions.len());
-        for tx in block.transactions {
-            let sender_display = if tx.sender.len() > 10 {
-                format!("{}...", &tx.sender[..10])
-            } else {
-                tx.sender.clone()
-            };
-            println!("  - From: {}", sender_display);
-            println!("    To: {}", tx.receiver);
-            println!("    Amount: {}", tx.amount);
-            println!("    Valid: {}", tx.is_valid());
-        }
+async fn mine_block(State(state): State<Arc<AppState>>) -> Result<Json<Block>, (StatusCode, String)> {
+    let mut bc = state.blockchain.write().unwrap();
+    match bc.mine_pending_transactions() {
+        Ok(_) => {
+            let latest_block = bc.chain.last().unwrap().clone();
+            Ok(Json(latest_block))
+        },
+        Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
     }
 }
